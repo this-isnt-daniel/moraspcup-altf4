@@ -10,3 +10,12 @@ competition_data/submissions/
 
 __pycache__/
 *.py[cod]
+
+# Model weights — large binary files, do NOT commit
+weights/
+*.pth
+*.pt
+*.ckpt
+
+# Pre-cleaned image cache — reproducible, do NOT commit
+precleaned/
