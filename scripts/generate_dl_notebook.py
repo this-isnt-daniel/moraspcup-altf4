@@ -107,12 +107,14 @@ assert NOISY_DIR.exists(), f'Missing: {NOISY_DIR}'
 PATCH_SIZE        = 128   # training crop size
 N_PATCHES_PER_IMG = 16    # random patches extracted per image per epoch
 BATCH_SIZE        = 16
-EPOCHS_FULL       = 60    # full training run
+EPOCHS_FULL       = 30    # full training run (30 is enough to converge on 460 images)
 LR_INIT           = 3e-4
 LR_MIN            = 1e-6
 SEED              = 42
 TRAIN_N           = 400   # images in training split
 VAL_N             = 60    # images in validation split
+VAL_FAST_N        = 20    # images used for fast in-training validation (PSNR only)
+VAL_FREQ          = 10    # validate every N epochs during training
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -419,10 +421,36 @@ class CombinedLoss(nn.Module):
 
 # ── Training utilities ────────────────────────────────────────────────────────
 
+def fast_validate_model(model: nn.Module, val_ids: list, device: torch.device,
+                         n: int = VAL_FAST_N) -> dict:
+    '''
+    Fast in-training validation: PSNR only on first n val images.
+    Skips skimage SSIM (which takes 2-3s per 992x992 image and dominates epoch time).
+    Used for checkpoint selection during training — full SSIM runs only in final eval.
+    Returns mean_psnr and mean_delta_psnr (used as proxy for composite to pick best ckpt).
+    '''
+    model.eval()
+    psnrs, delta_psnrs = [], []
+    with torch.no_grad():
+        for img_id in val_ids[:n]:
+            gt    = load_rgb_float(GT_DIR    / f'{img_id}.png')
+            noisy = load_rgb_float(NOISY_DIR / f'{img_id}_noise.png')
+            nt    = torch.from_numpy(noisy.transpose(2, 0, 1)).unsqueeze(0).to(device)
+            pred  = model(nt).squeeze(0).cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
+            p      = float(sk_psnr(gt, pred,  data_range=1.0))
+            np_    = float(sk_psnr(gt, noisy, data_range=1.0))
+            psnrs.append(p)
+            delta_psnrs.append(p - np_)
+    return {
+        'mean_psnr':       float(np.mean(psnrs)),
+        'mean_delta_psnr': float(np.mean(delta_psnrs)),
+    }
+
+
 def validate_model(model: nn.Module, val_ids: list, device: torch.device) -> dict:
     '''
-    Evaluate model on full validation images using the official metric logic.
-    No patches — full 992x992 images.
+    Full validation with official metrics (PSNR + SSIM + composite).
+    Only called in the final evaluation cells, not during training.
     '''
     model.eval()
     rows = []
@@ -488,30 +516,34 @@ def train_model(name: str, model: nn.Module, train_loader: DataLoader,
         history['epoch'].append(epoch)
         history['train_loss'].append(train_loss)
 
-        do_val = (epoch % 5 == 0) or (epoch == 1) or (epoch == n_epochs)
+        # Fast PSNR-only val every VAL_FREQ epochs (avoids slow skimage SSIM per epoch)
+        do_val = (epoch % VAL_FREQ == 0) or (epoch == 1) or (epoch == n_epochs)
         if do_val:
-            val_m = validate_model(model, val_ids, device)
-            composite = val_m['mean_composite']
-            history['val_composite'].append(composite)
+            val_m   = fast_validate_model(model, val_ids, device, n=VAL_FAST_N)
+            delta_p = val_m['mean_delta_psnr']
+            history['val_composite'].append(delta_p)   # use dPSNR as proxy during training
             history['val_psnr'].append(val_m['mean_psnr'])
-            history['val_ssim'].append(val_m['mean_ssim'])
+            history['val_ssim'].append(0.0)            # placeholder; full SSIM at final eval
             saved = ''
-            if composite > best_composite:
-                best_composite = composite
+            if delta_p > best_composite:
+                best_composite = delta_p
                 torch.save({'epoch': epoch, 'model_state': model.state_dict(),
-                            'composite': composite, 'n_params': n_params,
+                            'delta_psnr': delta_p, 'n_params': n_params,
                             'optimizer_state': optimizer.state_dict()},
                            save_path)
                 saved = '  *SAVED*'
             print(f'  [Ep {epoch:3d}/{n_epochs}] loss={train_loss:.4f}  '
-                  f'val_composite={composite:.6f}{saved}  ({epoch_time:.1f}s)')
+                  f'val_dPSNR={delta_p:.4f}{saved}  ({epoch_time:.1f}s)')
             if epoch == 1:
-                est = epoch_time * (n_epochs - 1) / 60
-                print(f'  -> Estimated remaining training time: {est:.1f} min')
+                epochs_left = n_epochs - 1
+                val_checks  = epochs_left // VAL_FREQ
+                est_min = (epoch_time * epochs_left) / 60
+                print(f'  -> Est. remaining: {est_min:.1f} min  '
+                      f'({val_checks} val checkpoints x {VAL_FAST_N} imgs each)')
         else:
             print(f'  [Ep {epoch:3d}/{n_epochs}] loss={train_loss:.4f}  ({epoch_time:.1f}s)')
 
-    print(f'Done. Best val composite: {best_composite:.6f}  saved -> {save_path}')
+    print(f'Done. Best val dPSNR: {best_composite:.4f}  saved -> {save_path}')
     return history, best_composite
 
 
@@ -1106,11 +1138,32 @@ del hybrid_cnn_tmp
 cells.append(code("""\
 # ── Hybrid validation helper (takes pre-cleaned input, not raw noisy) ─────────
 
+def fast_validate_hybrid(model: nn.Module, val_ids: list,
+                          precleaned_dir: Path, device: torch.device,
+                          n: int = VAL_FAST_N) -> dict:
+    '''Fast PSNR-only hybrid validation for in-training checkpoint selection.'''
+    model.eval()
+    psnrs, delta_psnrs = [], []
+    with torch.no_grad():
+        for img_id in val_ids[:n]:
+            gt    = load_rgb_float(GT_DIR    / f'{img_id}.png')
+            noisy = load_rgb_float(NOISY_DIR / f'{img_id}_noise.png')
+            pre   = load_rgb_float(precleaned_dir / f'{img_id}.png')
+            pt    = torch.from_numpy(pre.transpose(2, 0, 1)).unsqueeze(0).to(device)
+            pred  = model(pt).squeeze(0).cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
+            p   = float(sk_psnr(gt, pred,  data_range=1.0))
+            np_ = float(sk_psnr(gt, noisy, data_range=1.0))
+            psnrs.append(p)
+            delta_psnrs.append(p - np_)
+    return {'mean_psnr': float(np.mean(psnrs)),
+            'mean_delta_psnr': float(np.mean(delta_psnrs))}
+
+
 def validate_hybrid(model: nn.Module, val_ids: list,
                     precleaned_dir: Path, device: torch.device) -> dict:
     '''
-    Evaluate hybrid model: pre-cleaned image -> model -> score vs GT.
-    Uses the original noisy image as the "noisy" baseline for delta metrics.
+    Full validation with official metrics (PSNR + SSIM + composite).
+    Only called in final eval cells, not during training.
     '''
     model.eval()
     rows = []
@@ -1121,7 +1174,7 @@ def validate_hybrid(model: nn.Module, val_ids: list,
             pre   = load_rgb_float(precleaned_dir     / f'{img_id}.png')
             pt    = torch.from_numpy(pre.transpose(2, 0, 1)).unsqueeze(0).to(device)
             pred  = model(pt).squeeze(0).cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
-            rows.append(score_pair(pred, gt, noisy))   # delta vs original noisy
+            rows.append(score_pair(pred, gt, noisy))
     return {
         'mean_psnr':       float(np.mean([r['psnr']       for r in rows])),
         'mean_ssim':       float(np.mean([r['ssim']       for r in rows])),
@@ -1173,26 +1226,26 @@ def train_hybrid_model(name: str, model: nn.Module,
         history['epoch'].append(epoch)
         history['train_loss'].append(train_loss)
 
-        do_val = (epoch % 5 == 0) or (epoch == 1) or (epoch == n_epochs)
+        do_val = (epoch % VAL_FREQ == 0) or (epoch == 1) or (epoch == n_epochs)
         if do_val:
-            val_m = validate_hybrid(model, val_ids, precleaned_dir, device)
-            composite = val_m['mean_composite']
-            history['val_composite'].append(composite)
+            val_m   = fast_validate_hybrid(model, val_ids, precleaned_dir, device, n=VAL_FAST_N)
+            delta_p = val_m['mean_delta_psnr']
+            history['val_composite'].append(delta_p)
             saved = ''
-            if composite > best_composite:
-                best_composite = composite
+            if delta_p > best_composite:
+                best_composite = delta_p
                 torch.save({'epoch': epoch, 'model_state': model.state_dict(),
-                            'composite': composite, 'n_params': n_params}, save_path)
+                            'delta_psnr': delta_p, 'n_params': n_params}, save_path)
                 saved = '  *SAVED*'
             print(f'  [Ep {epoch:3d}/{n_epochs}] loss={train_loss:.4f}  '
-                  f'val_composite={composite:.6f}{saved}  ({epoch_time:.1f}s)')
+                  f'val_dPSNR={delta_p:.4f}{saved}  ({epoch_time:.1f}s)')
             if epoch == 1:
                 est = epoch_time * (n_epochs - 1) / 60
-                print(f'  -> Estimated remaining time: {est:.1f} min')
+                print(f'  -> Est. remaining: {est:.1f} min')
         else:
             print(f'  [Ep {epoch:3d}/{n_epochs}] loss={train_loss:.4f}  ({epoch_time:.1f}s)')
 
-    print(f'Done. Best composite: {best_composite:.6f}  -> {save_path}')
+    print(f'Done. Best val dPSNR: {best_composite:.4f}  -> {save_path}')
     return history, best_composite
 
 print('Hybrid training utilities ready.')
