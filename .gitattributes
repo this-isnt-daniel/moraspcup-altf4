@@ -1,0 +1,19 @@
+# Normalize line endings: always store as LF in the repo
+* text=auto eol=lf
+
+# Explicitly LF for code and notebooks
+*.py    text eol=lf
+*.ipynb text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.csv   text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Binary files — no line ending conversion
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.pth   binary
+*.pt    binary
