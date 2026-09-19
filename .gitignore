@@ -22,3 +22,6 @@ precleaned/
 
 # Colab Notebook outputs and checkpoints
 colab_outputs/
+
+# Hyperparameter sweep outputs (large checkpoint and image files)
+sweep_outputs/
