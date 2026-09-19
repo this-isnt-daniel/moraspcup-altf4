@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
 """
 denoise.py  — Mora SP Cup 2026 submission inference script.
-Architecture: NAFNet-style Gated Residual U-Net (custom implementation).
-Checkpoint  : sweep_outputs/run_lr3e4_ssim/checkpoints/run_lr3e4_ssim_best.pth
-Alpha blend : 0.0 (pure neural, no wavelet blend)
-
-USAGE:
-    python scripts/denoise.py --noise_dir INPUT_DIR --denoised_dir OUTPUT_DIR
-    python scripts/denoise.py --noise_dir INPUT_DIR --denoised_dir OUTPUT_DIR --device cpu
+Architecture: Heavyweight NAFNet-style Gated Residual U-Net (width=32, blocks=4).
 """
 
 import argparse, math, sys, time
 from pathlib import Path
-
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-
-# ── Architecture (NAFNet-style Gated Residual U-Net) ──────────────────────
 class ChannelNorm(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -73,12 +64,9 @@ class Denoiser(nn.Module):
         for up, dec, s in zip(self.up, self.dec, reversed(skips)): z = dec(up(z) + s)
         return (p + self.tail(z))[..., :h, :w]
 
-
-# ── Inference helpers ──────────────────────────────────────────────────────
 def tiled(model, x, tile=384, overlap=64):
     h, w = x.shape[-2:]
-    if h <= tile and w <= tile:
-        return model(x).float()
+    if h <= tile and w <= tile: return model(x).float()
     def starts(n):
         if n <= tile: return [0]
         return sorted(set(list(range(0, n - tile + 1, tile - overlap)) + [n - tile]))
@@ -96,73 +84,49 @@ def tiled(model, x, tile=384, overlap=64):
 
 @torch.inference_mode()
 def predict(model, array, device, tile=384, overlap=64):
-    x = torch.from_numpy(np.ascontiguousarray(
-        array.transpose(2, 0, 1))).float()[None].to(device) / 255
+    x = torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1))).float()[None].to(device) / 255
     model.eval()
-    result = tiled(model, x, tile, overlap).clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy()
-    return result
+    return tiled(model, x, tile, overlap).clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy()
 
-def read_image(path):
-    with Image.open(path) as im:
-        a = np.asarray(im)
-    if a.ndim == 2: a = a[..., None]
-    return np.array(a, copy=True)
-
-def write_image(path, arr):
-    out = np.rint(np.clip(arr, 0, 1) * 255).astype(np.uint8)
-    Image.fromarray(out[..., 0] if out.shape[-1] == 1 else out).save(path)
-
-
-# ── Main ───────────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--noise_dir',    required=True,  type=Path)
-    ap.add_argument('--denoised_dir', required=True,  type=Path)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--noise_dir', required=True, type=Path)
+    ap.add_argument('--denoised_dir', required=True, type=Path)
     ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'])
     args = ap.parse_args()
 
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(args.device)
-    if device.type == 'cuda' and not torch.cuda.is_available():
-        print('WARNING: CUDA unavailable, falling back to CPU.', file=sys.stderr)
-        device = torch.device('cpu')
+    device = torch.device('cuda' if args.device != 'cpu' and torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}', flush=True)
 
-    # Resolve checkpoint relative to this script's location
     script_dir = Path(__file__).resolve().parent
-    repo_root  = script_dir.parent
-    ckpt_path  = repo_root / 'sweep_outputs/run_lr3e4_ssim/checkpoints/run_lr3e4_ssim_best.pth'
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
+    repo_root = script_dir.parent
+
+    ckpt_path = script_dir / 'weights' / 'best_model.pth'
+    if not ckpt_path.exists(): raise FileNotFoundError(f'Missing: {ckpt_path}')
 
     state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    c     = state['config']
-    model = Denoiser(c['channels'], c['width'], c['blocks'])
+    c = state['config']
+    model = Denoiser(c['channels'], c.get('width', 24), c.get('blocks', 2))
     model.load_state_dict(state['model'])
     model = model.to(device).eval()
-    print(f'Loaded: {ckpt_path.name} (channels={c["channels"]}, '
-          f'width={c["width"]}, blocks={c["blocks"]})', flush=True)
+
+    print(f'Loaded Heavyweight model: width={c["width"]} blocks={c["blocks"]}', flush=True)
 
     args.denoised_dir.mkdir(parents=True, exist_ok=True)
     inputs = sorted(args.noise_dir.glob('*_noise.png'))
-    if not inputs:
-        raise FileNotFoundError(f'No *_noise.png files found in {args.noise_dir}')
 
     t0 = time.perf_counter()
     for p in inputs:
-        img_id  = p.stem[:-len('_noise')]   # e.g. "461_noise" -> "461"
-        out_name = f'{img_id}.png'
-        arr  = read_image(p)
-        pred = predict(model, arr, device, tile=384, overlap=64)
-        write_image(args.denoised_dir / out_name, pred)
-        print(f'  {p.name} -> {out_name}  '
-              f'({(time.perf_counter()-t0)*1000/max(1,inputs.index(p)+1):.0f} ms/img avg)',
-              flush=True)
-    total = time.perf_counter() - t0
-    print(f'Done: {len(inputs)} images in {total:.1f}s '
-          f'({total/len(inputs)*1000:.0f} ms/image, device={device})', flush=True)
+        out_name = f'{p.stem[:-6]}.png'
+        arr = np.asarray(Image.open(p))
+        if arr.ndim == 2: arr = arr[..., None]
+
+        pred = predict(model, arr, device, 384, 64)
+
+        out = np.rint(np.clip(pred, 0, 1) * 255).astype(np.uint8)
+        Image.fromarray(out[..., 0] if out.shape[-1] == 1 else out).save(args.denoised_dir / out_name)
+
+        print(f'  {p.name} -> {out_name}', flush=True)
 
 if __name__ == '__main__':
     main()

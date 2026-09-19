@@ -17,6 +17,10 @@ weights/
 *.pt
 *.ckpt
 
+# EXCEPTION: Allow the final submission weight
+!scripts/weights/
+!scripts/weights/best_model.pth
+
 # Pre-cleaned image cache — reproducible, do NOT commit
 precleaned/
 
