@@ -25,3 +25,6 @@ colab_outputs/
 
 # Hyperparameter sweep outputs (large checkpoint and image files)
 sweep_outputs/
+
+# Ensemble notebook outputs
+ensemble_outputs/
