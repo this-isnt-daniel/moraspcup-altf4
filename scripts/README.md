@@ -10,10 +10,16 @@ The submitted model is a **Heavyweight Gated Residual U-Net** (NAFNet-style) fea
 
 ## Instructions
 
-1. **Place Test Images:** 
+1. **Environment Setup:**
+   Ensure you have installed the required dependencies from this folder:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Place Test Images:** 
    Ensure the blind test images (e.g., `461_noise.png` to `480_noise.png`) are placed inside `../competition_data/submissions/noisy/`.
 
-2. **Run Inference:**
+3. **Run Inference:**
    To denoise the directory of images, run the following command from within the `scripts/` folder:
 
 ```bash
